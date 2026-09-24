@@ -1,542 +1,93 @@
 <!doctype html>
 <html lang="en">
 <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>MySync — Clipboard</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token() }}">
+  <title>MySync</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script src="https://cdn.socket.io/4.8.1/socket.io.min.js" defer></script>
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
 </head>
 <body>
-    <main class="app">
-        <header class="header">
-            <div>
-                <p class="eyebrow">LOCAL SYNC</p>
-                <h1>MySync</h1>
-                <p class="subtitle">Your private clipboard, stored on your local network.</p>
-            </div>
-            <div id="connection" class="status offline">
-                <span></span>
-                Connecting
-            </div>
-        </header>
-
-        <section class="device-card">
-            <div>
-                <p class="eyebrow">THIS DEVICE</p>
-                <h2 id="current-device-name">Unnamed device</h2>
-                <p class="device-id">ID: <code id="current-device-id"></code></p>
-            </div>
-            <button id="rename-button" class="secondary-button">Rename</button>
-        </section>
-
-        <section class="composer">
-            <textarea id="clipboard"
-                placeholder="Paste or type something here..."></textarea>
-
-            <div class="composer-bottom">
-                <span id="character-count">0 characters</span>
-                <button id="add-button">Share clipboard</button>
-            </div>
-        </section>
-
-        <section class="history-section">
-            <div class="section-header">
-                <div>
-                    <p class="eyebrow">DEVICES</p>
-                    <h2>Shared clipboards</h2>
-                </div>
-                <input id="search" class="search" type="search" placeholder="Search devices and clips...">
-            </div>
-
-            <div id="empty" class="empty">
-                <div class="empty-icon">⌁</div>
-                <h3>No devices yet</h3>
-                <p>Share something from this or another device to get started.</p>
-            </div>
-
-            <div id="devices" class="devices"></div>
-        </section>
-    </main>
-
-    <script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script>
-    <script>
-    (function () {
-        "use strict";
-
-        /* ------------------------------------------------------------------
-         * Element references
-         * ------------------------------------------------------------------ */
-        const currentDeviceIdEl = document.getElementById("current-device-id");
-        const currentDeviceNameEl = document.getElementById("current-device-name");
-        const renameButton = document.getElementById("rename-button");
-        const clipboardEl = document.getElementById("clipboard");
-        const addButton = document.getElementById("add-button");
-        const searchEl = document.getElementById("search");
-        const countEl = document.getElementById("character-count");
-        const connectionEl = document.getElementById("connection");
-        const devicesEl = document.getElementById("devices");
-        const emptyEl = document.getElementById("empty");
-
-        let items = [];
-        let lastSignature = null;
-
-        /* ------------------------------------------------------------------
-         * Device identity
-         *
-         * IMPORTANT: crypto.randomUUID() only exists in a "secure context"
-         * (https:// or http://localhost). When you open the app from another
-         * device on the LAN via http://192.168.x.x:8000 the function is
-         * undefined, so we need a fallback.
-         * ------------------------------------------------------------------ */
-        function uuid() {
-            if (window.crypto && typeof window.crypto.randomUUID === "function") {
-                return window.crypto.randomUUID();
-            }
-
-            // getRandomValues() works in non-secure contexts too.
-            if (window.crypto && typeof window.crypto.getRandomValues === "function") {
-                const bytes = new Uint8Array(16);
-                window.crypto.getRandomValues(bytes);
-                bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
-                bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 10
-                const hex = Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
-                return hex.slice(0, 8) + "-" + hex.slice(8, 12) + "-" +
-                       hex.slice(12, 16) + "-" + hex.slice(16, 20) + "-" + hex.slice(20);
-            }
-
-            // Last resort.
-            return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => {
-                const r = (Math.random() * 16) | 0;
-                const v = c === "x" ? r : (r & 0x3) | 0x8;
-                return v.toString(16);
-            });
-        }
-
-        function safeGet(key) {
-            try { return window.localStorage.getItem(key); }
-            catch (e) { return null; }
-        }
-
-        function safeSet(key, value) {
-            try { window.localStorage.setItem(key, value); }
-            catch (e) { /* private mode / storage disabled — ignore */ }
-        }
-
-        function getOrCreateDeviceId() {
-            let id = safeGet("mysync-device-id");
-
-            if (!id) {
-                id = uuid();
-                safeSet("mysync-device-id", id);
-            }
-
-            return id;
-        }
-
-        const deviceId = getOrCreateDeviceId();
-
-        function getDeviceName() {
-            return safeGet("mysync-device-name") || "Unnamed device";
-        }
-
-        function setDeviceName(name) {
-            name = (name || "").trim();
-            if (!name) name = "Unnamed device";
-
-            safeSet("mysync-device-name", name);
-            updateDeviceHeader();
-
-            // Re-publish nothing; the name is attached to future posts.
-            // Existing items keep their old name until re-shared.
-        }
-
-        function updateDeviceHeader() {
-            currentDeviceIdEl.textContent = deviceId;
-            currentDeviceNameEl.textContent = getDeviceName();
-        }
-
-        renameButton.addEventListener("click", () => {
-            const name = window.prompt("Device name:", getDeviceName());
-            if (name !== null) setDeviceName(name);
-        });
-
-        /* ------------------------------------------------------------------
-         * Clipboard copy with a fallback for non-secure contexts
-         * ------------------------------------------------------------------ */
-        async function copyToClipboard(text) {
-            if (navigator.clipboard && window.isSecureContext) {
-                try {
-                    await navigator.clipboard.writeText(text);
-                    return true;
-                } catch (e) {
-                    /* fall through to legacy path */
-                }
-            }
-
-            const ta = document.createElement("textarea");
-            ta.value = text;
-            ta.setAttribute("readonly", "");
-            ta.style.position = "fixed";
-            ta.style.top = "0";
-            ta.style.left = "-9999px";
-            document.body.appendChild(ta);
-            ta.select();
-            ta.setSelectionRange(0, text.length);
-
-            let ok = false;
-            try { ok = document.execCommand("copy"); }
-            catch (e) { ok = false; }
-
-            document.body.removeChild(ta);
-            return ok;
-        }
-
-        /* ------------------------------------------------------------------
-         * Rendering
-         * ------------------------------------------------------------------ */
-        const collapsedState = new Map(); // device_id -> boolean
-
-        function formatTime(value) {
-            const date = new Date(value);
-            if (Number.isNaN(date.getTime())) return value;
-
-            return new Intl.DateTimeFormat(undefined, {
-                dateStyle: "medium",
-                timeStyle: "short"
-            }).format(date);
-        }
-
-        function signature(list) {
-            return list
-                .map(i => i.id + ":" + i.content.length + ":" + i.created_at)
-                .join("|");
-        }
-
-        function showButtonFeedback(button, text) {
-            const original = button.textContent;
-            button.textContent = text;
-            setTimeout(() => { button.textContent = original; }, 1000);
-        }
-
-        function render() {
-            const query = searchEl.value.trim().toLowerCase();
-
-            const grouped = new Map();
-
-            for (const item of items) {
-                if (!grouped.has(item.device_id)) {
-                    grouped.set(item.device_id, {
-                        device_id: item.device_id,
-                        device_name: item.device_name,
-                        items: []
-                    });
-                }
-                grouped.get(item.device_id).items.push(item);
-            }
-
-            let devices = Array.from(grouped.values());
-
-            if (query) {
-                devices = devices
-                    .map(device => ({
-                        ...device,
-                        items: device.items.filter(item =>
-                            item.content.toLowerCase().includes(query) ||
-                            (item.device_name || "").toLowerCase().includes(query)
-                        )
-                    }))
-                    .filter(device =>
-                        (device.device_name || "").toLowerCase().includes(query) ||
-                        device.device_id.toLowerCase().includes(query) ||
-                        device.items.length > 0
-                    );
-            }
-
-            devicesEl.innerHTML = "";
-            emptyEl.hidden = devices.length !== 0;
-
-            for (const device of devices) {
-                const section = document.createElement("section");
-                section.className = "device-section";
-
-                const header = document.createElement("button");
-                header.className = "device-header";
-                header.type = "button";
-
-                const left = document.createElement("div");
-                left.className = "device-header-left";
-
-                const icon = document.createElement("div");
-                icon.className = "device-icon";
-                icon.textContent = "⌘";
-
-                const titleBlock = document.createElement("div");
-
-                const title = document.createElement("h3");
-                title.textContent = device.device_name || "Unnamed device";
-
-                const idEl = document.createElement("p");
-                idEl.textContent = device.device_id;
-
-                titleBlock.append(title, idEl);
-                left.append(icon, titleBlock);
-
-                const right = document.createElement("div");
-                right.className = "device-header-right";
-
-                const count = document.createElement("span");
-                count.className = "item-count";
-                count.textContent =
-                    device.items.length + " item" + (device.items.length === 1 ? "" : "s");
-
-                const chevron = document.createElement("span");
-                chevron.className = "chevron";
-                chevron.textContent = "⌄";
-
-                right.append(count, chevron);
-                header.append(left, right);
-
-                const list = document.createElement("div");
-                list.className = "device-items";
-
-                // Collapse state survives re-renders.
-                if (!collapsedState.has(device.device_id)) {
-                    collapsedState.set(device.device_id, device.device_id !== deviceId);
-                }
-                const isCollapsed = collapsedState.get(device.device_id);
-
-                if (isCollapsed) {
-                    list.classList.add("collapsed");
-                    chevron.classList.add("collapsed");
-                }
-
-                for (const item of device.items) {
-                    const card = document.createElement("article");
-                    card.className = "clipboard-item";
-
-                    const content = document.createElement("div");
-                    content.className = "item-content";
-                    content.textContent = item.content;
-
-                    const footer = document.createElement("div");
-                    footer.className = "item-footer";
-
-                    const time = document.createElement("time");
-                    time.className = "time";
-                    time.textContent = formatTime(item.created_at);
-
-                    const actions = document.createElement("div");
-                    actions.className = "actions";
-
-                    const copy = document.createElement("button");
-                    copy.type = "button";
-                    copy.textContent = "Copy";
-                    copy.addEventListener("click", async event => {
-                        event.stopPropagation();
-                        const ok = await copyToClipboard(item.content);
-                        if (ok) {
-                            showButtonFeedback(copy, "Copied");
-                        } else {
-                            window.prompt("Copy manually (Ctrl/Cmd + C):", item.content);
-                        }
-                    });
-
-                    const deleteButton = document.createElement("button");
-                    deleteButton.type = "button";
-                    deleteButton.textContent = "Delete";
-                    deleteButton.className = "danger";
-                    deleteButton.addEventListener("click", async event => {
-                        event.stopPropagation();
-
-                        try {
-                            const response = await fetch("/api/clipboards/" + item.id, {
-                                method: "DELETE"
-                            });
-                            if (!response.ok) throw new Error("delete failed");
-                        } catch (e) {
-                            window.alert("Could not delete the clipboard item.");
-                        }
-
-                        refresh();
-                    });
-
-                    actions.append(copy, deleteButton);
-                    footer.append(time, actions);
-                    card.append(content, footer);
-                    list.appendChild(card);
-                }
-
-                header.addEventListener("click", () => {
-                    list.classList.toggle("collapsed");
-                    chevron.classList.toggle("collapsed");
-                    collapsedState.set(
-                        device.device_id,
-                        list.classList.contains("collapsed")
-                    );
-                });
-
-                section.append(header, list);
-                devicesEl.appendChild(section);
-            }
-        }
-
-        /* ------------------------------------------------------------------
-         * Data loading
-         * ------------------------------------------------------------------ */
-        function setStatus(online) {
-            if (online) {
-                connectionEl.className = "status online";
-                connectionEl.innerHTML = "<span></span>Connected";
-            } else {
-                connectionEl.className = "status offline";
-                connectionEl.innerHTML = "<span></span>Offline";
-            }
-        }
-
-        async function refresh() {
-            try {
-                const response = await fetch("/api/clipboards", { cache: "no-store" });
-                if (!response.ok) throw new Error("HTTP " + response.status);
-
-                const data = await response.json();
-                setStatus(true);
-
-                const sig = signature(data);
-                if (sig !== lastSignature) {
-                    lastSignature = sig;
-                    items = data;
-                    render();
-                }
-            } catch (e) {
-                setStatus(false);
-            }
-        }
-
-        function upsertItem(item) {
-            const index = items.findIndex(x => x.id === item.id);
-            if (index === -1) items.unshift(item);
-            else items[index] = item;
-
-            items.sort((a, b) => b.id - a.id);
-            lastSignature = null; // force a re-render
-            render();
-        }
-
-        /* ------------------------------------------------------------------
-         * Add clipboard
-         * ------------------------------------------------------------------ */
-        async function addClipboard() {
-            const content = clipboardEl.value;
-
-            if (!content.trim()) return;
-
-            addButton.disabled = true;
-
-            try {
-                const response = await fetch("/api/clipboards", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        device_id: deviceId,
-                        device_name: getDeviceName(),
-                        content: content
-                    })
-                });
-
-                const data = await response.json().catch(() => ({}));
-
-                if (!response.ok) {
-                    window.alert(data.error || "Could not add clipboard item.");
-                    return;
-                }
-
-                clipboardEl.value = "";
-                updateCount();
-                upsertItem(data);
-            } catch (e) {
-                window.alert("Could not reach the server.");
-            } finally {
-                addButton.disabled = false;
-            }
-        }
-
-        function updateCount() {
-            countEl.textContent =
-                clipboardEl.value.length.toLocaleString() + " characters";
-        }
-
-        /* ------------------------------------------------------------------
-         * Socket.IO (optional — the app works fine without it)
-         * ------------------------------------------------------------------ */
-        let socket = null;
-
-        if (typeof window.io === "function") {
-            try {
-                socket = window.io();
-
-                socket.on("connect", () => {
-                    setStatus(true);
-                    refresh();
-                });
-
-                socket.on("disconnect", () => setStatus(false));
-
-                socket.on("connect_error", () => setStatus(false));
-
-                socket.on("clipboard_snapshot", data => {
-                    const sig = signature(data);
-                    if (sig !== lastSignature) {
-                        lastSignature = sig;
-                        items = data;
-                        render();
-                    }
-                });
-
-                socket.on("clipboard_added", item => {
-                    lastSignature = null;
-                    upsertItem(item);
-                });
-
-                socket.on("clipboard_deleted", data => {
-                    items = items.filter(item => item.id !== data.id);
-                    lastSignature = null;
-                    render();
-                });
-            } catch (e) {
-                socket = null;
-            }
-        }
-
-        /* ------------------------------------------------------------------
-         * Polling fallback — keeps every device in sync even if websockets
-         * are blocked (which is common on locked-down LANs / some routers).
-         * ------------------------------------------------------------------ */
-        setInterval(refresh, 2500);
-        document.addEventListener("visibilitychange", () => {
-            if (!document.hidden) refresh();
-        });
-
-        /* ------------------------------------------------------------------
-         * Wiring
-         * ------------------------------------------------------------------ */
-        addButton.addEventListener("click", addClipboard);
-        clipboardEl.addEventListener("input", updateCount);
-
-        clipboardEl.addEventListener("keydown", event => {
-            if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
-                addClipboard();
-            }
-        });
-
-        searchEl.addEventListener("input", render);
-
-        /* ------------------------------------------------------------------
-         * Boot
-         * ------------------------------------------------------------------ */
-        updateDeviceHeader();
-        updateCount();
-        refresh();
-    })();
-    </script>
+  <header class="topbar">
+    <div>
+      <div class="brand">MySync</div>
+      <div class="topbar-sub">Your clipboard, across your devices and selected people.</div>
+    </div>
+    <form method="post" action="{{ url_for('logout_post') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button class="ghost-btn" type="submit">Log out</button>
+    </form>
+  </header>
+
+  <main class="app-shell">
+    <section class="profile-grid">
+      <article class="panel profile-panel">
+        <div class="section-kicker">ACCOUNT</div>
+        <h2>{{ user.display_name }}</h2>
+        <p class="muted">{{ user.email }}</p>
+        <div class="id-row">
+          <div>
+            <div class="tiny muted">Your MySync ID</div>
+            <code id="my-id">{{ user.public_id }}</code>
+          </div>
+          <button class="secondary-btn" id="copy-id-btn" type="button">Copy ID</button>
+        </div>
+        <p class="tiny muted">Give this ID to someone who should be able to add you and see clipboard items you mark as shared.</p>
+      </article>
+
+      <article class="panel">
+        <div class="section-kicker">ADD A PERSON</div>
+        <h2>Share with someone</h2>
+        <p class="muted">Enter their MySync ID. You will then see the clipboard text they chose to share with contacts.</p>
+        <div class="inline-form">
+          <input id="contact-id" type="text" placeholder="MS-XXXXXXXXXXXX" maxlength="20" autocomplete="off">
+          <button class="primary-btn" id="add-contact-btn" type="button">Add</button>
+        </div>
+        <div id="contacts" class="contacts-list"></div>
+      </article>
+    </section>
+
+    <section class="panel composer">
+      <div class="composer-heading">
+        <div>
+          <div class="section-kicker">NEW CLIPBOARD</div>
+          <h2>Share some text</h2>
+        </div>
+        <span id="device-label" class="device-chip">Device</span>
+      </div>
+      <textarea id="clipboard-input" placeholder="Paste or type something here…"></textarea>
+      <div class="composer-bottom">
+        <label class="device-field">
+          Device name
+          <input id="device-name" type="text" maxlength="80" autocomplete="off">
+        </label>
+        <label class="checkbox-label">
+          <input id="share-toggle" type="checkbox" checked>
+          <span>Share with my contacts</span>
+        </label>
+        <button class="primary-btn" id="add-clipboard-btn" type="button">Add to MySync</button>
+      </div>
+      <div id="composer-status" class="tiny muted"></div>
+    </section>
+
+    <section class="history-toolbar">
+      <div>
+        <div class="section-kicker">HISTORY</div>
+        <h2>Clipboards</h2>
+      </div>
+      <input id="search-input" class="search-input" type="search" placeholder="Search text, people or devices…" autocomplete="off">
+    </section>
+
+    <section id="history" class="history"></section>
+    <div id="empty-state" class="empty-state hidden">
+      <div class="empty-icon">⌘</div>
+      <h3>No clipboard items yet</h3>
+      <p class="muted">Add text above. Shared items will also appear for contacts you follow.</p>
+    </div>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
 </body>
 </html>
